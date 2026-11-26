@@ -2,7 +2,6 @@
 ; loader definitions
 SPACK_FLAG_META_XOR     = 0x1
 SPACK_FLAG_PAYLOAD_XOR  = 0x2
-SPACK_FLAG_PAYLOAD_RLE  = 0x4
 SPACK_XOR_KEY           = 0xA5 ; single fixed byte, just obfuscation
 
 SYS_READ        = 0x0

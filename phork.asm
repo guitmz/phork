@@ -145,7 +145,7 @@ entry $                                          ; entry point is just the first
     mov [packFlags], rax
     ; Reject unknown flag bits early so the stub never tries to best effort
     ; decode a format revision it does not actually understand
-    test rax, not (SPACK_FLAG_META_XOR or SPACK_FLAG_PAYLOAD_XOR or SPACK_FLAG_PAYLOAD_RLE)
+    test rax, not (SPACK_FLAG_META_XOR or SPACK_FLAG_PAYLOAD_XOR)
     jnz invalidPackFlags
 
     ; Validate the embedded ranges so obviously malformed packs fail early
@@ -213,13 +213,8 @@ entry $                                          ; entry point is just the first
     ; These are the original single PT_LOAD bytes after mkpack stripped the
     ; ELF header/program header prefix away from the original SHELF image
     mov rdi, [targetFd]
-    lea rsi, [buffer]                            ; plain payloads can be staged directly into their final buffer
-    mov rax, [packFlags]                         ; transformed payloads may need a temporary decode staging area first
-    test rax, SPACK_FLAG_PAYLOAD_RLE
-    jz .payloadDstReady
-    lea rsi, [interpBuffer]                      ; RLE payloads are staged here first, then expanded into buffer
-    .payloadDstReady:
-    mov rdx, [packPayloadLen]                    ; encoded payload byte count exactly as stored on disk
+    lea rsi, [buffer]                            ; staged directly into its final buffer
+    mov rdx, [packPayloadLen]                    ; payload byte count exactly as stored on disk
     mov rax, SYS_PREAD64
     mov r10, [packPayloadOff]
     syscall
@@ -228,15 +223,7 @@ entry $                                          ; entry point is just the first
     mov rax, [packFlags]                            ; the builder may have XORed the payload blob too
     test rax, SPACK_FLAG_PAYLOAD_XOR
     jz .payloadDecoded
-    mov rax, [packFlags]                            ; RLE payloads were staged in interpBuffer, plain payloads in buffer
-    test rax, SPACK_FLAG_PAYLOAD_RLE
-    jz .xorPlainPayload
-    lea rsi, [interpBuffer]                      ; de-XOR the encoded payload in place before running the RLE decoder
-    mov rcx, [packPayloadLen]
-    call xorBufferInPlace
-    jmp .payloadDecoded
-    .xorPlainPayload:
-    lea rsi, [buffer]                              ; plain payloads were staged directly in their final destination buffer
+    lea rsi, [buffer]
     mov rcx, [packPayloadLen]
     call xorBufferInPlace
     .payloadDecoded:
@@ -244,24 +231,11 @@ entry $                                          ; entry point is just the first
     ; The embedded stripped payload must match the metadata derived expectation
     mov rax, [loadFilesz]                        ; original PT_LOAD file size
     sub rax, [headerSpan]                        ; stripped payload size = PT_LOAD.filesz - stripped header span
-    mov [expectedPayloadSize], rax               ; remember the size the decoded payload must expand to
-    mov r11, [packFlags]                         ; flags rechecked here to decide whether the RLE expansion path runs next
-    test r11, SPACK_FLAG_PAYLOAD_RLE
-    jz .plainPayload
-    lea rsi, [interpBuffer]                   ; encoded RLE stream, feeds decodeRlePayload
-    mov rdx, [packPayloadLen]
-    lea rdi, [buffer]                         ; destination for the fully decoded stripped payload
-    mov rcx, [expectedPayloadSize]            ; exact decoded byte count the RLE stream must expand to
-    call decodeRlePayload
-    mov rax, [expectedPayloadSize]
-    mov [fstat.st_size], rax                     ; from here on fstat.st_size tracks the decoded payload length, not the packed file size
-    jmp .payloadReady
-    .plainPayload:
+    mov [expectedPayloadSize], rax               ; the size the stored payload must equal
     mov rax, [packPayloadLen]
     mov [fstat.st_size], rax                    ; the rest of the load path only cares about the stripped payload byte count
     cmp rax, [expectedPayloadSize]
     jne invalidPayloadSize
-    .payloadReady:
 
     ; Reserve, synthesize, populate, and protect the one SHELF PT_LOAD span
     mov rax, [loadMemsz]                         ; memsz, not filesz, since the mapping must cover any bss beyond the file backed bytes
@@ -445,6 +419,8 @@ parseMetaBin:
     add rsi, 8
     mov rax, [rsi]
     mov [tlsMemsz], rax
+    cmp [tlsFilesz], rax                          ; filesz > memsz would underflow the zero fill count in stack.inc
+    ja invalidMetaFormat
     add rsi, 8
     mov rax, [rsi]
     mov [tlsAlign], rax
@@ -500,6 +476,11 @@ synthesizeHeaders:
     ; total PHDR table bytes = phnum * phentsize
     movzx rax, word [ehdr.phentsize]
     imul rcx, rax
+    mov rax, [phoffValue]
+    add rax, rcx                                 ; first byte past the synthetic PHDR table
+    jc invalidMetaFormat                         ; offset+size wrap is never a valid range inside the image
+    cmp rax, [imageSpanSize]                     ; the PHDR table must land inside the mapped image, not past it
+    ja invalidMetaFormat
     rep movsb
     pop rcx
     pop rsi
@@ -523,73 +504,6 @@ xorBufferInPlace:
         dec rcx
         jmp .loop
     .done:
-    pop rax
-    ret
-
-decodeRlePayload:
-    ; rsi = encoded source, rdx = encoded byte count
-    ; rdi = decoded destination, rcx = expected decoded byte count
-    ;
-    ; Token format:
-    ;   high bit clear -> literal block, count = low7 + 1, next <count> bytes copied as is
-    ;   high bit set   -> run block,     count = low7 + 1, next 1 byte repeated <count> times
-    ;
-    ; Any malformed token stream or size mismatch is treated as a hard format 
-    ; error rather than a best effort decode
-    ; preserves every register this function touches since it is called from more than one site
-    push rax
-    push rbx
-    push r8
-    push r9
-    push r10
-    push r11
-    xor r8, r8                                   ; encoded input offset
-    xor r9, r9                                   ; decoded output offset
-    .nextToken:
-        cmp r8, rdx
-        je .done
-        mov al, [rsi + r8]                       ; current RLE control byte
-        inc r8                                   ; consume the control byte
-        movzx r10, al
-        and r10, 0x7f                            ; lower 7 bits encode (count - 1)
-        inc r10                                  ; number of output bytes for this token
-        mov r11, r9
-        add r11, r10                             ; decoded offset after this token
-        cmp r11, rcx
-        ja invalidPayloadEncoding
-        test al, 0x80                            ; high bit distinguishes run tokens from literal tokens
-        jz .literal
-        cmp r8, rdx                              ; run tokens need one more source byte for the repeated value
-        jae invalidPayloadEncoding
-        mov bl, [rsi + r8]                       ; repeated byte value
-        inc r8
-        .runLoop:
-            mov [rdi + r9], bl
-            inc r9
-            dec r10
-            jnz .runLoop
-        jmp .nextToken
-        .literal:
-        mov r11, r8
-        add r11, r10                             ; literal token consumes count literal bytes from the encoded stream
-        cmp r11, rdx
-        ja invalidPayloadEncoding
-        .litLoop:
-            mov bl, [rsi + r8]
-            mov [rdi + r9], bl
-            inc r8
-            inc r9
-            dec r10
-            jnz .litLoop
-        jmp .nextToken
-    .done:
-    cmp r9, rcx                                  ; the decoded payload must expand to exactly the metadata described size
-    jne invalidPayloadEncoding
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbx
     pop rax
     ret
 
@@ -641,11 +555,6 @@ invalidMetaFormat:
 invalidPayloadSize:
     lea rsi, [invalidPayloadSizeMsg]
     mov rdx, invalidPayloadSizeMsgLen
-    jmp writeError
-
-invalidPayloadEncoding:
-    lea rsi, [invalidPayloadEncodingMsg]
-    mov rdx, invalidPayloadEncodingMsgLen
     jmp writeError
 
 invalidPackFlags:
@@ -843,8 +752,6 @@ invalidMetaFormatMsg    db "Embedded SHELFBN1 metadata is malformed or unsupport
 invalidMetaFormatMsgLen = $ - invalidMetaFormatMsg
 invalidPayloadSizeMsg   db "Embedded payload size does not match the size described by SHELFBN1", 0xa
 invalidPayloadSizeMsgLen = $ - invalidPayloadSizeMsg
-invalidPayloadEncodingMsg db "Embedded payload RLE stream is malformed or expands to the wrong size", 0xa
-invalidPayloadEncodingMsgLen = $ - invalidPayloadEncodingMsg
 invalidPackFlagsMsg     db "Packed file uses unknown SPACK footer flags", 0xa
 invalidPackFlagsMsgLen  = $ - invalidPackFlagsMsg
 

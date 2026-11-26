@@ -108,8 +108,8 @@ entry $
     mov rdx, [fileStat.st_size]                  ; input ELF byte count
     mov rax, SYS_READ
     syscall
-    test rax, rax
-    jle fileReadFailed
+    cmp rax, [fileStat.st_size]                  ; a short read would leave the PHDR scan parsing stale buffer bytes
+    jne fileReadFailed
 
     cmp dword [buf + EHDR.magic], 0x464c457f      ; require ELF magic
     jne invalidElf

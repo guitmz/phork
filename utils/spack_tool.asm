@@ -120,6 +120,7 @@ entry $
     cmp rax, [footerOff]                         ; meta_off itself must sit before the footer
     jae invalidMetaRange
     add rax, [metaLen]
+    jc invalidMetaRange                          ; meta_off + meta_len wrap is never a valid range inside the file
     cmp rax, [footerOff]                         ; meta_off + meta_len must not run into the footer either
     ja invalidMetaRange
 
@@ -127,6 +128,7 @@ entry $
     cmp rax, [footerOff]                         ; same two sided check for the payload range
     jae invalidPayloadRange
     add rax, [payloadLen]
+    jc invalidPayloadRange                       ; payload_off + payload_len wrap is never a valid range inside the file
     cmp rax, [footerOff]                         ; payload_off + payload_len must not run into the footer either
     ja invalidPayloadRange
 
@@ -185,7 +187,7 @@ entry $
 
     .validate:
     mov rax, [flagsValue]                       ; reject future/unknown flags this validator does not understand
-    test rax, not (SPACK_FLAG_META_XOR or SPACK_FLAG_PAYLOAD_XOR or SPACK_FLAG_PAYLOAD_RLE) ; any bit outside the three known flags is unknown/future
+    test rax, not (SPACK_FLAG_META_XOR or SPACK_FLAG_PAYLOAD_XOR) ; any bit outside the known flags is unknown/future
     jnz invalidFlags
     ; Bound against this tool's own copyBuf scratch size, which is sized to
     ; match the runtime's real ceiling: a fixed 144 byte header plus up to a
@@ -249,13 +251,9 @@ entry $
     add rax, [phdrBlobSize]                      ; total meta_len must equal the fixed header plus that blob
     cmp rax, [metaLen]
     jne invalidMetaFormat
-    mov rax, [flagsValue]                        ; if the payload is RLE compressed, length equality alone is not meaningful
-    test rax, SPACK_FLAG_PAYLOAD_RLE
-    jnz .validateOk
-    mov rax, [payloadLen]
+    mov rax, [payloadLen]                        ; stored payload must equal load_filesz - header_span
     cmp rax, [expectedPayloadLen]
     jne invalidPayloadSize
-    .validateOk:        ; reached either because RLE makes length equality meaningless, or because the check above already passed
     lea rsi, [validateOkMsg]
     mov rdx, validateOkMsgLen
     call writeStdout
